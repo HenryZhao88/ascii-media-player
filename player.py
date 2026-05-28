@@ -4,8 +4,6 @@ import time
 import shutil
 import subprocess
 
-import cv2
-
 
 RAMP = " .,:;i1tfLCG08@"
 
@@ -13,23 +11,42 @@ RAMP = " .,:;i1tfLCG08@"
 def fit_dimensions(src_w, src_h, max_w, max_h):
     aspect = src_w / src_h
     char_aspect = 0.5
-    height = max_h
-    width = int(height * aspect / char_aspect)
-    if width > max_w:
-        width = max_w
-        height = int(width * char_aspect / aspect)
-    return max(1, width), max(1, height)
+    width = max_w
+    height = int(width * char_aspect / aspect)
+    if height > max_h:
+        height = max_h
+        width = int(height * aspect / char_aspect)
+    return max(1, min(width, max_w)), max(1, min(height, max_h))
 
 
-def frame_to_ascii(frame, width, height):
-    resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    last = len(RAMP) - 1
-    rows = []
-    for row in gray:
-        chars = [RAMP[(v * last) // 255] for v in row]
-        rows.append("".join(chars))
-    return "\n".join(rows)
+def probe_video(path):
+    out = subprocess.check_output(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,r_frame_rate",
+            "-of", "csv=p=0:s=,",
+            path,
+        ],
+        text=True,
+    ).strip()
+    w_s, h_s, rate = out.split(",")[:3]
+    num, den = rate.split("/")
+    fps = float(num) / float(den) if float(den) else 24.0
+    return int(w_s), int(h_s), fps
+
+
+def start_video(path, width, height):
+    return subprocess.Popen(
+        [
+            "ffmpeg", "-loglevel", "quiet", "-i", path,
+            "-vf", f"scale={width}:{height}:flags=area",
+            "-pix_fmt", "gray",
+            "-f", "rawvideo", "-",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def start_audio(path):
@@ -45,54 +62,80 @@ def start_audio(path):
         return None
 
 
+def build_lut():
+    last = len(RAMP) - 1
+    return bytes(ord(RAMP[(v * last) // 255]) for v in range(256))
+
+
 def play(path):
     if not os.path.exists(path):
         print(f"file not found: {path}")
         return
 
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        print(f"could not open: {path}")
+    try:
+        src_w, src_h, fps = probe_video(path)
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        print(f"ffprobe failed (install ffmpeg): {e}")
         return
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    term = shutil.get_terminal_size((80, 24))
+    width, height = fit_dimensions(src_w, src_h, term.columns, term.lines - 1)
+    frame_size = width * height
+
+    try:
+        proc = start_video(path, width, height)
+    except FileNotFoundError:
+        print("ffmpeg not found. install ffmpeg.")
+        return
+
     audio = start_audio(path)
+    lut = build_lut()
 
     out = sys.stdout
+    out_buf = out.buffer
     out.write("\x1b[?25l\x1b[2J")
     out.flush()
 
     start = time.time()
     index = 0
+    line_clear = b"\x1b[K\n"
 
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
+            data = proc.stdout.read(frame_size)
+            if len(data) < frame_size:
                 break
 
-            term = shutil.get_terminal_size((80, 24))
-            src_h, src_w = frame.shape[:2]
-            w, h = fit_dimensions(src_w, src_h, term.columns, term.lines - 1)
-            art = frame_to_ascii(frame, w, h)
+            pixels = data.translate(lut)
+            rows = [pixels[i * width:(i + 1) * width] for i in range(height)]
+            art = line_clear.join(rows) + b"\x1b[J"
 
-            out.write("\x1b[H" + art)
-            out.flush()
+            out_buf.write(b"\x1b[H" + art)
+            out_buf.flush()
 
             index += 1
             target = start + index / fps
             now = time.time()
             if target > now:
                 time.sleep(target - now)
-            elif now - target > 1.0:
+            elif now - target > 0.5:
                 skip = int((now - target) * fps)
-                for _ in range(skip):
-                    cap.grab()
-                    index += 1
+                drop = skip * frame_size
+                while drop > 0:
+                    chunk = proc.stdout.read(min(drop, frame_size * 32))
+                    if not chunk:
+                        break
+                    drop -= len(chunk)
+                index += skip
     except KeyboardInterrupt:
         pass
     finally:
-        cap.release()
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         if audio and audio.poll() is None:
             audio.terminate()
             try:
