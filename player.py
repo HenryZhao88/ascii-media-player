@@ -5,18 +5,21 @@ import shutil
 import subprocess
 
 
-RAMP = " .,:;i1tfLCG08@"
+QUADRANTS = [c.encode() for c in " ▘▝▀▖▌▞▛▗▚▐▜▄▙▟█"]
 
 
-def fit_dimensions(src_w, src_h, max_w, max_h):
+def fit_pixel_dimensions(src_w, src_h, max_cols, max_rows):
+    max_px_w = max_cols * 2
+    max_px_h = max_rows * 2
     aspect = src_w / src_h
-    char_aspect = 0.5
-    width = max_w
-    height = int(width * char_aspect / aspect)
-    if height > max_h:
-        height = max_h
-        width = int(height * aspect / char_aspect)
-    return max(1, min(width, max_w)), max(1, min(height, max_h))
+    px_w = max_px_w
+    px_h = int(px_w / (2 * aspect))
+    if px_h > max_px_h:
+        px_h = max_px_h
+        px_w = int(px_h * 2 * aspect)
+    px_w -= px_w % 2
+    px_h -= px_h % 2
+    return max(2, px_w), max(2, px_h)
 
 
 def probe_video(path):
@@ -63,11 +66,6 @@ def start_audio(path):
         return None
 
 
-def build_char_lut():
-    last = len(RAMP) - 1
-    return [RAMP[(v * last) // 255].encode() for v in range(256)]
-
-
 def play(path):
     if not os.path.exists(path):
         print(f"file not found: {path}")
@@ -80,19 +78,20 @@ def play(path):
         return
 
     term = shutil.get_terminal_size((80, 24))
-    width, height = fit_dimensions(src_w, src_h, term.columns, term.lines - 1)
-    frame_size = width * height * 3
-    row_size = width * 3
+    px_w, px_h = fit_pixel_dimensions(src_w, src_h, term.columns, term.lines - 1)
+    cols = px_w // 2
+    rows = px_h // 2
+    frame_size = px_w * px_h * 3
+    row_size = px_w * 3
 
     try:
-        proc = start_video(path, width, height)
+        proc = start_video(path, px_w, px_h)
     except FileNotFoundError:
         print("ffmpeg not found. install ffmpeg.")
         return
     assert proc.stdout is not None
 
     audio = start_audio(path)
-    char_lut = build_char_lut()
 
     out = sys.stdout
     out_buf = out.buffer
@@ -111,23 +110,47 @@ def play(path):
                 break
 
             parts = [b"\x1b[H"]
-            for y in range(height):
-                base = y * row_size
-                row = data[base:base + row_size]
-                last_color = None
-                for x in range(width):
-                    i = x * 3
-                    r = row[i]
-                    g = row[i + 1]
-                    b = row[i + 2]
-                    color = (r, g, b)
-                    if color != last_color:
-                        parts.append(b"\x1b[38;2;%d;%d;%dm" % color)
-                        last_color = color
-                    lum = (r * 299 + g * 587 + b * 114) // 1000
-                    parts.append(char_lut[lum])
+            for y in range(rows):
+                top = (y * 2) * row_size
+                bot = (y * 2 + 1) * row_size
+                last_fg = None
+                last_bg = None
+                for x in range(cols):
+                    i = x * 6
+                    j = i + 3
+                    p0 = (data[top + i], data[top + i + 1], data[top + i + 2])
+                    p1 = (data[top + j], data[top + j + 1], data[top + j + 2])
+                    p2 = (data[bot + i], data[bot + i + 1], data[bot + i + 2])
+                    p3 = (data[bot + j], data[bot + j + 1], data[bot + j + 2])
+                    pix = (p0, p1, p2, p3)
+
+                    lums = [p[0] * 299 + p[1] * 587 + p[2] * 114 for p in pix]
+                    thr = (min(lums) + max(lums)) >> 1
+
+                    bits = 0
+                    fr = fg_g = fb = 0
+                    br_ = bg_g = bb = 0
+                    fc = bc = 0
+                    for k in range(4):
+                        p = pix[k]
+                        if lums[k] > thr:
+                            bits |= 1 << k
+                            fr += p[0]; fg_g += p[1]; fb += p[2]; fc += 1
+                        else:
+                            br_ += p[0]; bg_g += p[1]; bb += p[2]; bc += 1
+                    fg = (fr // fc, fg_g // fc, fb // fc) if fc else pix[0]
+                    bgc = (br_ // bc, bg_g // bc, bb // bc) if bc else pix[0]
+
+                    if fg != last_fg:
+                        parts.append(b"\x1b[38;2;%d;%d;%dm" % fg)
+                        last_fg = fg
+                    if bgc != last_bg:
+                        parts.append(b"\x1b[48;2;%d;%d;%dm" % bgc)
+                        last_bg = bgc
+                    parts.append(QUADRANTS[bits])
+                parts.append(reset)
                 parts.append(line_end)
-            parts.append(reset + b"\x1b[J")
+            parts.append(b"\x1b[J")
 
             out_buf.write(b"".join(parts))
             out_buf.flush()
