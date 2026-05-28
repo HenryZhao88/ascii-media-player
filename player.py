@@ -41,11 +41,12 @@ def start_video(path, width, height):
         [
             "ffmpeg", "-loglevel", "quiet", "-i", path,
             "-vf", f"scale={width}:{height}:flags=area",
-            "-pix_fmt", "gray",
+            "-pix_fmt", "rgb24",
             "-f", "rawvideo", "-",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        bufsize=0,
     )
 
 
@@ -62,9 +63,9 @@ def start_audio(path):
         return None
 
 
-def build_lut():
+def build_char_lut():
     last = len(RAMP) - 1
-    return bytes(ord(RAMP[(v * last) // 255]) for v in range(256))
+    return [RAMP[(v * last) // 255].encode() for v in range(256)]
 
 
 def play(path):
@@ -80,16 +81,18 @@ def play(path):
 
     term = shutil.get_terminal_size((80, 24))
     width, height = fit_dimensions(src_w, src_h, term.columns, term.lines - 1)
-    frame_size = width * height
+    frame_size = width * height * 3
+    row_size = width * 3
 
     try:
         proc = start_video(path, width, height)
     except FileNotFoundError:
         print("ffmpeg not found. install ffmpeg.")
         return
+    assert proc.stdout is not None
 
     audio = start_audio(path)
-    lut = build_lut()
+    char_lut = build_char_lut()
 
     out = sys.stdout
     out_buf = out.buffer
@@ -98,7 +101,8 @@ def play(path):
 
     start = time.time()
     index = 0
-    line_clear = b"\x1b[K\n"
+    line_end = b"\x1b[K\n"
+    reset = b"\x1b[0m"
 
     try:
         while True:
@@ -106,11 +110,26 @@ def play(path):
             if len(data) < frame_size:
                 break
 
-            pixels = data.translate(lut)
-            rows = [pixels[i * width:(i + 1) * width] for i in range(height)]
-            art = line_clear.join(rows) + b"\x1b[J"
+            parts = [b"\x1b[H"]
+            for y in range(height):
+                base = y * row_size
+                row = data[base:base + row_size]
+                last_color = None
+                for x in range(width):
+                    i = x * 3
+                    r = row[i]
+                    g = row[i + 1]
+                    b = row[i + 2]
+                    color = (r, g, b)
+                    if color != last_color:
+                        parts.append(b"\x1b[38;2;%d;%d;%dm" % color)
+                        last_color = color
+                    lum = (r * 299 + g * 587 + b * 114) // 1000
+                    parts.append(char_lut[lum])
+                parts.append(line_end)
+            parts.append(reset + b"\x1b[J")
 
-            out_buf.write(b"\x1b[H" + art)
+            out_buf.write(b"".join(parts))
             out_buf.flush()
 
             index += 1
@@ -121,7 +140,7 @@ def play(path):
             elif now - target > 0.5:
                 skip = int((now - target) * fps)
                 drop = skip * frame_size
-                while drop > 0:
+                while drop > 0 and proc.stdout is not None:
                     chunk = proc.stdout.read(min(drop, frame_size * 32))
                     if not chunk:
                         break
